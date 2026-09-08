@@ -7,6 +7,8 @@ const roomsRoutes = require('./modules/rooms/rooms.routes');
 const reservationsRoutes = require('./modules/reservations/reservations.routes');
 const menuRoutes = require('./modules/menu/menu.routes');
 const foodOrdersRoutes = require('./modules/foodOrders/foodOrders.routes');
+const invoicesRoutes = require('./modules/invoices/invoices.routes');
+const paymentsRoutes = require('./modules/payments/payments.routes');
 
 const app = express();
 app.use(express.json());
@@ -27,6 +29,8 @@ app.use('/api/rooms', roomsRoutes);
 app.use('/api/reservations', reservationsRoutes);
 app.use('/api/menu', menuRoutes);
 app.use('/api/food-orders', foodOrdersRoutes);
+app.use('/api/invoices', invoicesRoutes);
+app.use('/api/payments', paymentsRoutes);
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
