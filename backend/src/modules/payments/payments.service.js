@@ -38,6 +38,7 @@ async function recordPayment({ invoice_id, amount, method, staff_id }) {
       const err = new Error(`Payment amount exceeds the outstanding balance of ${remaining.toFixed(2)}`);
       err.status = 400;
       throw err;
+    console.error('CHAPA INIT ERROR:', err.response ? err.response.data : err.message);
     }
 
     let transaction_id, payment;
@@ -91,3 +92,118 @@ async function getPaymentById(id) {
 }
 
 module.exports = { recordPayment, listPaymentsForInvoice, getPaymentById };
+
+const { initializeTransaction, verifyTransaction } = require('../../config/chapa');
+
+function randomTxRef() {
+  return `dmhms-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
+}
+
+async function initializeChapaPayment({ invoice_id, method, email }) {
+  const invoiceResult = await pool.query('SELECT * FROM invoices WHERE id = $1', [invoice_id]);
+  const invoice = invoiceResult.rows[0];
+  if (!invoice) {
+    const err = new Error('Invoice not found');
+    err.status = 404;
+    throw err;
+  }
+  if (invoice.status === 'paid') {
+    const err = new Error('Invoice is already fully paid');
+    err.status = 409;
+    throw err;
+  }
+
+  const paidResult = await pool.query(
+    `SELECT COALESCE(SUM(amount), 0) AS paid FROM payments WHERE invoice_id = $1 AND status = 'success'`,
+    [invoice_id]
+  );
+  const remaining = Number(invoice.total_amount) - Number(paidResult.rows[0].paid);
+  if (remaining <= 0) {
+    const err = new Error('No outstanding balance on this invoice');
+    err.status = 409;
+    throw err;
+  }
+
+  const tx_ref = randomTxRef();
+
+  await pool.query(
+    `INSERT INTO payments (transaction_id, invoice_id, amount, method, chapa_tx_ref, status)
+     VALUES ($1, $2, $3, $4, $5, 'pending')`,
+    [tx_ref, invoice_id, remaining, method, tx_ref]
+  );
+
+  let chapaResponse;
+  try {
+    chapaResponse = await initializeTransaction({
+      amount: remaining,
+      currency: 'ETB',
+      email,
+      tx_ref,
+      return_url: process.env.CHAPA_RETURN_URL || 'http://localhost:5000/api/payments/chapa/return',
+    });
+    } catch (err) {
+    await pool.query(`UPDATE payments SET status = 'failed' WHERE chapa_tx_ref = $1`, [tx_ref]);
+    const wrapped = new Error('Failed to initialize Chapa transaction');
+    wrapped.status = 502;
+    throw wrapped;
+  }
+  return { tx_ref, checkout_url: chapaResponse.data.checkout_url };
+}
+
+async function handleChapaWebhook(tx_ref) {
+  const paymentResult = await pool.query('SELECT * FROM payments WHERE chapa_tx_ref = $1', [tx_ref]);
+  const payment = paymentResult.rows[0];
+  if (!payment) {
+    const err = new Error('Unknown transaction reference');
+    err.status = 404;
+    throw err;
+  }
+
+  if (payment.status !== 'pending') {
+    return { message: 'Already processed', payment };
+  }
+
+  let verification;
+  try {
+    verification = await verifyTransaction(tx_ref);
+  } catch (err) {
+    const wrapped = new Error('Failed to verify transaction with Chapa');
+    wrapped.status = 502;
+    throw wrapped;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    if (verification.data && verification.data.status === 'success') {
+      await client.query(`UPDATE payments SET status = 'success' WHERE id = $1`, [payment.id]);
+
+      const invoiceResult = await client.query('SELECT * FROM invoices WHERE id = $1 FOR UPDATE', [payment.invoice_id]);
+      const invoice = invoiceResult.rows[0];
+      const paidResult = await client.query(
+        `SELECT COALESCE(SUM(amount), 0) AS paid FROM payments WHERE invoice_id = $1 AND status = 'success'`,
+        [payment.invoice_id]
+      );
+      const totalPaid = Number(paidResult.rows[0].paid);
+      const newStatus = totalPaid >= Number(invoice.total_amount) ? 'paid' : 'partially_paid';
+
+      await client.query(`UPDATE invoices SET status = $1, updated_at = NOW() WHERE id = $2`, [newStatus, payment.invoice_id]);
+    } else {
+      await client.query(`UPDATE payments SET status = 'failed' WHERE id = $1`, [payment.id]);
+    }
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  const updated = await pool.query('SELECT * FROM payments WHERE id = $1', [payment.id]);
+  return { message: 'Processed', payment: updated.rows[0] };
+}
+
+module.exports.initializeChapaPayment = initializeChapaPayment;
+module.exports.handleChapaWebhook = handleChapaWebhook;
